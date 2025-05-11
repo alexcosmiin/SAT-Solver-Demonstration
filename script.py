@@ -5,7 +5,31 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict, Counter
 import sys
+import threading
+import multiprocessing
 
+def make_dpll_random(verbose):
+    return DPLLSolver(verbose=verbose, branching_heuristic="random")
+
+def make_dpll_most_common(verbose):
+    return DPLLSolver(verbose=verbose, branching_heuristic="most_common")
+
+def make_dpll_jeroslow_wang(verbose):
+    return DPLLSolver(verbose=verbose, branching_heuristic="jeroslow_wang")
+
+class SolverThread(threading.Thread):
+    def __init__(self, solver, problem):
+        super().__init__()
+        self.solver = solver
+        self.problem = problem
+        self.result = None
+        self.exception = None
+
+    def run(self):
+        try:
+            self.result = self.solver.solve(self.problem)
+        except Exception as e:
+            self.exception = e
 
 class SATInstance:
     """Representation of a SAT formula in CNF form."""
@@ -831,6 +855,13 @@ class DPLLSolver:
 
         return result
 
+def solver_worker(algo_constructor, problem, verbose, return_dict):
+    try:
+        solver = algo_constructor(verbose)
+        result = solver.solve(problem)
+        return_dict["result"] = result
+    except Exception as e:
+        return_dict["exception"] = str(e)
 
 def run_experiment(problem_sets, algorithms, timeout=60, verbose=False):
     """
@@ -838,12 +869,12 @@ def run_experiment(problem_sets, algorithms, timeout=60, verbose=False):
 
     Args:
         problem_sets: List of SAT instances to solve.
-        algorithms: List of SAT solving algorithms to compare.
-        timeout: Maximum time in seconds for each algorithm on each instance.
-        verbose: Whether to print detailed information during solving.
+        algorithms: Dictionary of SAT solving algorithm constructors.
+        timeout: Timeout per instance in seconds.
+        verbose: Verbose output.
 
     Returns:
-        Dictionary with experiment results.
+        Dictionary with results.
     """
     results = {
         "solving_times": defaultdict(list),
@@ -851,61 +882,53 @@ def run_experiment(problem_sets, algorithms, timeout=60, verbose=False):
         "timeouts": defaultdict(int)
     }
 
+    def worker(algo_constructor, problem, verbose, return_dict):
+        try:
+            solver = algo_constructor(verbose)
+            result = solver.solve(problem)
+            return_dict["result"] = result
+        except Exception as e:
+            return_dict["exception"] = str(e)
+
     for i, problem in enumerate(problem_sets):
         print(f"\n======= Problem {i + 1}/{len(problem_sets)} =======")
         print(f"Number of variables: {problem.num_vars}")
         print(f"Number of clauses: {len(problem.clauses)}")
 
-        # Display a portion of the formula for reference
         formula_str = problem.display_formula()
         preview_len = min(100, len(formula_str))
         print(f"Formula preview: {formula_str[:preview_len]}..." if len(formula_str) > preview_len else formula_str)
 
-        for algo_name, algo in algorithms.items():
+        for algo_name, algo_constructor in algorithms.items():
             print(f"\nRunning {algo_name}...")
 
-            # Set low verbosity for experiments
-            if hasattr(algo, 'verbose'):
-                algo.verbose = verbose
+            manager = multiprocessing.Manager()
+            return_dict = manager.dict()
 
-            # Run algorithm with timeout
-            start_time = time.time()
-            try:
-                # Set the timeout
-                import signal
+            process = multiprocessing.Process(target=solver_worker, args=(algo_constructor, problem, verbose, return_dict))
 
-                def handler(signum, frame):
-                    raise TimeoutError("Algorithm timed out")
+            start_time = time.perf_counter()
+            process.start()
+            process.join(timeout)
+            elapsed_time = time.perf_counter() - start_time
 
-                signal.signal(signal.SIGALRM, handler)
-                signal.alarm(timeout)
-
-                # Run the algorithm
-                result = algo.solve(problem)
-
-                # Disable the alarm
-                signal.alarm(0)
-
-                elapsed_time = time.time() - start_time
-
-                print(f"{algo_name} completed in {elapsed_time:.2f} seconds with result: {result}")
-
-                results["solving_times"][algo_name].append(elapsed_time)
-                results["results"][algo_name].append(result)
-
-            except TimeoutError:
-                elapsed_time = time.time() - start_time
-                print(f"{algo_name} timed out after {elapsed_time:.2f} seconds")
+            if process.is_alive():
+                process.terminate()
+                process.join()
+                print(f"{algo_name} timed out after {elapsed_time:.5f} seconds")
                 results["timeouts"][algo_name] += 1
                 results["solving_times"][algo_name].append(timeout)
                 results["results"][algo_name].append("TIMEOUT")
-
-            except Exception as e:
-                print(f"{algo_name} encountered an error: {e}")
+            elif "exception" in return_dict:
+                print(f"{algo_name} encountered an error: {return_dict['exception']}")
                 results["solving_times"][algo_name].append(None)
                 results["results"][algo_name].append("ERROR")
+            else:
+                print(f"{algo_name} completed in {elapsed_time:.5f} seconds with result: {return_dict['result']}")
+                results["solving_times"][algo_name].append(elapsed_time)
+                results["results"][algo_name].append(return_dict["result"])
 
-    return results  # This was previously indented incorrectly
+    return results
 
 
 def plot_results(results, algorithms, title="Algorithm Performance Comparison"):
@@ -924,7 +947,7 @@ def plot_results(results, algorithms, title="Algorithm Performance Comparison"):
     solving_times = [results["solving_times"][algo] for algo in algo_names]
 
     plt.subplot(1, 2, 1)
-    plt.boxplot(solving_times, labels=algo_names)
+    plt.boxplot(solving_times, tick_labels=algo_names)
     plt.title("Solving Time Distribution")
     plt.ylabel("Time (seconds)")
     plt.grid(True, linestyle='--', alpha=0.7)
@@ -1049,11 +1072,11 @@ def main():
 
         # Define algorithms
         algorithms = {
-            "Resolution": ResolutionSolver(verbose=False),
-            "Davis-Putnam": DPSolver(verbose=False),
-            "DPLL (Random)": DPLLSolver(verbose=False, branching_heuristic="random"),
-            "DPLL (Most Common)": DPLLSolver(verbose=False, branching_heuristic="most_common"),
-            "DPLL (Jeroslow-Wang)": DPLLSolver(verbose=False, branching_heuristic="jeroslow_wang")
+            "Resolution": ResolutionSolver,
+            "Davis-Putnam": DPSolver,
+            "DPLL (Random)": make_dpll_random,
+            "DPLL (Most Common)": make_dpll_most_common,
+            "DPLL (Jeroslow-Wang)": make_dpll_jeroslow_wang,
         }
 
         # Run experiments
@@ -1067,18 +1090,25 @@ def main():
         # Print summary
         print("\nExperiment Summary:")
         for algo in algorithms:
-            total = len(results["results"][algo])
+            results_list = results["results"].get(algo, [])
+            times_list = results["solving_times"].get(algo, [])
+            total = len(results_list)
             timeouts = results["timeouts"].get(algo, 0)
-            sat_count = results["results"][algo].count("SATISFIABLE")
-            unsat_count = results["results"][algo].count("UNSATISFIABLE")
-            avg_time = np.mean([t for t in results["solving_times"][algo] if t is not None])
+            sat_count = results_list.count("SATISFIABLE")
+            unsat_count = results_list.count("UNSATISFIABLE")
+            non_timeout_times = [t for t in times_list if t is not None]
 
             print(f"{algo}:")
-            print(f"  Success rate: {(total - timeouts) / total * 100:.1f}%")
-            print(f"  SATISFIABLE: {sat_count}")
-            print(f"  UNSATISFIABLE: {unsat_count}")
-            print(f"  Timeouts: {timeouts}")
-            print(f"  Average time: {avg_time:.2f} seconds")
+            if total > 0:
+                success_rate = (total - timeouts) / total * 100
+                avg_time = np.mean(non_timeout_times) if non_timeout_times else 0
+                print(f"  Success rate: {success_rate:.1f}%")
+                print(f"  SATISFIABLE: {sat_count}")
+                print(f"  UNSATISFIABLE: {unsat_count}")
+                print(f"  Timeouts: {timeouts}")
+                print(f"  Average time: {avg_time:.2f} seconds")
+            else:
+                print("  No results recorded.")
 
 
 if __name__ == "__main__":
